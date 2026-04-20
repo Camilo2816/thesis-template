@@ -1,0 +1,251 @@
+% !TEX root = ./../main.tex
+% ============================================================
+%  Chapter 3: Methodology
+% ============================================================
+
+\chapter{Methodology}
+\label{chap:methodology}
+
+This chapter describes the simulation framework developed to study bounded-rational household savings behavior in the Colombian economy. The framework combines heterogeneous agent macroeconomics, natural language processing, and large language model (LLM) inference through four main components: a document preprocessing pipeline, a macroeconomic environment, a behavioral agent model, and a simulation engine.
+
+The chapter is organized as follows. Section~\ref{sec:overview} gives a high-level description of the system. Section~\ref{sec:sim_config} introduces the configurable parameters and the baseline specification used in experiments. Sections~\ref{sec:pipeline}--\ref{sec:design_choices} describe each component in detail.
+
+% [INSERT FIGURE: High-level architecture diagram showing the four main components (data pipeline, macroeconomic environment, agent model, simulation engine) and their interactions]
+
+% -----------------------------------------------------------
+\section{System Overview}
+\label{sec:overview}
+% -----------------------------------------------------------
+
+The simulation populates an economy with $N$ heterogeneous households and runs for $T$ discrete periods, each mapped to a calendar year starting from a configurable start year. At each period, an aggregate macroeconomic state is computed from a Cobb-Douglas production function and autoregressive shock processes. Agents form expectations by combining three sources of information: a retrieval-augmented generation (RAG) signal drawn from fiscal policy documents, a social signal propagated from better-informed peers, and their own prior expectation. These expectations then modify the savings decision, which is based on a pre-computed optimal policy from an Aiyagari incomplete-markets model.
+
+A configurable data cutoff year separates two document regimes. For periods up to and including that year, agents query a vector database built from real Colombian fiscal policy documents---the \textit{Marcos Fiscales de Mediano Plazo} (MFMPs) published annually by the Ministry of Finance. For later years, the system generates structured synthetic narratives from the simulated macroeconomic state, allowing the simulation to extend past the empirical record without changes to the pipeline.
+
+% -----------------------------------------------------------
+\section{Simulation Configuration}
+\label{sec:sim_config}
+% -----------------------------------------------------------
+
+All simulation parameters are set in a central YAML configuration file. This separation between model structure and parameter choices means that the same codebase can be used across experiments with different population sizes, time horizons, or behavioral settings without modifying any source code. Table~\ref{tab:sim_params} lists the configurable parameters together with the baseline values used in all experiments reported in this thesis, unless otherwise stated.
+
+\begin{table}[htbp]
+    \centering
+    \caption{Configurable simulation parameters and baseline values.}
+    \label{tab:sim_params}
+    \begin{tabular}{llcl}
+        \hline
+        \textbf{Parameter} & \textbf{Symbol} & \textbf{Baseline} & \textbf{Description} \\
+        \hline
+        Number of agents          & $N$                  & 50      & Households in the economy \\
+        Time horizon              & $T$                  & 100     & Number of simulated periods \\
+        Start year                & $y_{\text{start}}$   & 2010    & Calendar year of period $t = 0$ \\
+        Data cutoff year          & $y_{\text{cut}}$     & 2025    & Last year with real MFMP documents \\
+        Info.\ acquisition prob.\ & $p_{\text{info}}$    & 0.30    & Probability of RAG update per agent per period \\
+        Social noise std.\        & $\sigma_\eta$        & 0.05    & Std.\ deviation of social signal noise \\
+        RAG retrieval             & ---                  & enabled & Toggle for document-based signal \\
+        Social communication      & ---                  & enabled & Toggle for peer expectation channel \\
+        Behavioral adjustment     & ---                  & enabled & Toggle for expectation-driven savings scaling \\
+        \hline
+    \end{tabular}
+\end{table}
+
+The three binary toggles allow individual mechanisms to be disabled independently, supporting controlled ablation studies. When RAG retrieval is disabled, agents receive no document-based signal ($S^{\text{RAG}}_{i,t} = 0$). When social communication is disabled, the social signal is set to zero ($S^{\text{Social}}_{i,t} = 0$). When behavioral adjustment is disabled, agents follow the Aiyagari policy exactly regardless of their expectation.
+
+% -----------------------------------------------------------
+\section{Document Corpus and Preprocessing Pipeline}
+\label{sec:pipeline}
+% -----------------------------------------------------------
+
+The empirical corpus consists of sixteen annual MFMP documents covering the period from $y_{\text{start}}$ to $y_{\text{cut}}$ (2010--2025 in the baseline). These reports contain the Colombian government's official assessment of macroeconomic conditions, including inflation, unemployment, growth, monetary policy, and fiscal sustainability. The preprocessing pipeline converts this raw corpus into a queryable vector database in four stages.
+
+\subsection{PDF Extraction and Thematic Classification}
+
+PDFs are processed with PyMuPDF at the block level, where each block corresponds to a visually distinct paragraph. Blocks shorter than 50 characters are dropped to filter out headers and page numbers. Each remaining paragraph is assigned to one of five categories---\textsc{Inflation}, \textsc{Unemployment}, \textsc{Interest}, \textsc{Growth}, and \textsc{Fiscal}---by matching its content against Spanish-language keywords. Paragraphs containing \textit{inflación}, \textit{ipc}, or \textit{precios} go to \textsc{Inflation}; those with \textit{desempleo} or \textit{mercado laboral} go to \textsc{Unemployment}; and so on. Each category is capped at twenty paragraphs per document. The output for each year is a plain-text file with labeled section delimiters (\texttt{[INFLATION]}, \texttt{[GROWTH]}, etc.).
+
+\subsection{LLM-Based Summarization}
+
+Each structured document is enriched with an LLM-generated summary. The categorized content is submitted to a local \texttt{llama3} instance, served via Ollama and accessed through LiteLLM, with a prompt requesting a concise macroeconomic summary covering growth, inflation, unemployment, monetary policy, fiscal balance, external sector, and oil revenues. The summary is prepended to the document as a \texttt{[SUMMARY]} block and saved to \texttt{data/final\_docs/}.
+
+\subsection{Vector Database Construction}
+
+The enriched documents are split into 800-character chunks with 100-character overlap. Each chunk is embedded with the \texttt{all-MiniLM-L6-v2} sentence transformer and stored in ChromaDB with a \texttt{year} metadata tag. At query time, year-filtered similarity search allows agents to retrieve text that is both topically relevant and temporally appropriate to the current simulation period.
+
+% [INSERT FIGURE: Data preprocessing pipeline: PDFs -> PyMuPDF extraction -> thematic classification -> LLM summarization -> chunking and embedding -> ChromaDB]
+
+\subsection{Synthetic Narratives for Post-Cutoff Years}
+
+For years after $y_{\text{cut}}$, the system generates a narrative directly from the current simulated macro state using threshold-based rules. An inflation rate above 5\% produces the sentence ``Inflation is high. Prices are rising quickly and the cost of living is increasing.'' Negative growth yields ``Economic growth is negative. The economy is slowing down.'' The synthetic document follows the same section structure as the MFMP-derived files, so the LLM signal extraction pipeline runs without modification.
+
+% -----------------------------------------------------------
+\section{Macroeconomic Environment}
+\label{sec:economy}
+% -----------------------------------------------------------
+
+Aggregate capital at period $t$ is the sum of all household asset holdings:
+\begin{equation}
+    K_t = \sum_{i=1}^{N} a_{i,t},
+    \label{eq:aggregate_capital}
+\end{equation}
+with a floor of $10^{-4}$ for numerical stability. Output follows a Cobb-Douglas function:
+\begin{equation}
+    Y_t = A_t \cdot K_t^{\alpha} \cdot L^{1-\alpha},
+    \label{eq:cobb_douglas}
+\end{equation}
+where $\alpha = 0.36$ is the capital income share, $L = 1$ (normalized labor endowment), and $A_t$ is total factor productivity. Factor prices are determined as marginal products:
+\begin{align}
+    r_t &= \alpha \cdot A_t \cdot K_t^{\alpha - 1} - \delta, \label{eq:interest_rate} \\
+    w_t &= (1 - \alpha) \cdot A_t \cdot K_t^{\alpha}, \label{eq:wage}
+\end{align}
+with capital depreciation rate $\delta = 0.08$. Economic growth is $(Y_t - Y_{t-1}) / Y_{t-1}$, and a binary recession indicator is set to one when $g_t < 0$.
+
+Three macroeconomic variables follow independent AR(1) processes. Total factor productivity uses a log-linear specification:
+\begin{equation}
+    \log A_t = \rho_A \log A_{t-1} + \varepsilon_t^A, \quad \varepsilon_t^A \sim \mathcal{N}(0, \sigma_A^2),
+    \label{eq:ar1_productivity}
+\end{equation}
+with persistence $\rho_A = 0.9$ and shock standard deviation $\sigma_A = 0.02$. Inflation and unemployment follow levels-based processes:
+\begin{align}
+    \pi_t &= \rho_\pi \, \pi_{t-1} + \varepsilon_t^\pi, \quad \varepsilon_t^\pi \sim \mathcal{N}(0, \sigma_\pi^2), \label{eq:ar1_inflation} \\
+    u_t   &= \rho_u \, u_{t-1} + \varepsilon_t^u, \quad \varepsilon_t^u \sim \mathcal{N}(0, \sigma_u^2), \label{eq:ar1_unemployment}
+\end{align}
+with $(\rho_\pi, \sigma_\pi) = (0.7, 0.01)$ and $(\rho_u, \sigma_u) = (0.8, 0.01)$. Initial values are $A_0 = 1$, $\pi_0 = 0.02$, and $u_0 = 0.06$, calibrated to approximate Colombian long-run averages. These parameters characterize the model's structural dynamics and are treated as fixed calibration choices rather than configurable inputs.
+
+% [INSERT FIGURE: Sample AR(1) paths for productivity, inflation, and unemployment over the simulation horizon]
+
+% -----------------------------------------------------------
+\section{Heterogeneous Agent Model}
+\label{sec:agents}
+% -----------------------------------------------------------
+
+The economy is populated by $N$ agents, where $N$ is a configurable parameter (see Table~\ref{tab:sim_params}). Each agent is initialized with four attributes. Household wealth $a_{i,0}$ is drawn from $U[0, 5]$. The idiosyncratic productivity state $z_{i,t} \in \{0, 1, 2\}$ represents low, medium, and high labor productivity; it is initialized randomly and re-drawn each period. The macro-sensitivity parameter $x_i$, drawn uniformly from the discrete set $\{0.0,\, 0.2,\, 0.4,\, 0.7,\, 1.0\}$ at initialization and held fixed, governs how strongly the agent's expectations shift savings away from the Aiyagari optimum. Each agent is also assigned one of five cognitive types---\texttt{unemployment}, \texttt{inflation}, \texttt{interest}, \texttt{growth}, \texttt{informed}---drawn uniformly at random. The type determines both the topic of the agent's document query and its expectation formation weights.
+
+Income in period $t$ is:
+\begin{equation}
+    y_{i,t} = w_t \cdot (1 + 0.1 \cdot z_{i,t}),
+    \label{eq:income}
+\end{equation}
+where the premium $0.1 \cdot z_{i,t}$ scales with the agent's idiosyncratic productivity state.
+
+% [INSERT FIGURE: Agent type diagram showing the five types and their distinguishing parameters (weights and topical focus)]
+
+% -----------------------------------------------------------
+\section{Expectation Formation}
+\label{sec:expectations}
+% -----------------------------------------------------------
+
+Each agent updates its scalar expectation $E_{i,t}$ as a weighted average of three signals: a documentary RAG signal, a social signal from better-informed peers, and its own lagged expectation:
+\begin{equation}
+    E_{i,t} = \hat{\alpha}_i \cdot S^{\text{RAG}}_{i,t} + \hat{\beta}_i \cdot S^{\text{Social}}_{i,t} + \hat{\gamma}_i \cdot E_{i,t-1},
+    \label{eq:expectation_update}
+\end{equation}
+where the normalized weights are:
+\begin{equation}
+    \hat{\alpha}_i = \frac{\alpha_i}{\alpha_i + \beta_i + \gamma_i}, \quad
+    \hat{\beta}_i = \frac{\beta_i}{\alpha_i + \beta_i + \gamma_i}, \quad
+    \hat{\gamma}_i = \frac{\gamma_i}{\alpha_i + \beta_i + \gamma_i}.
+    \label{eq:normalized_weights}
+\end{equation}
+The raw weights $(\alpha_i, \beta_i, \gamma_i)$ are configurable per agent type and set in the YAML file. The baseline values used in this thesis are shown in Table~\ref{tab:expectation_weights}.
+
+\begin{table}[htbp]
+    \centering
+    \caption{Expectation formation weights by agent type (baseline configuration).}
+    \label{tab:expectation_weights}
+    \begin{tabular}{lccc}
+        \hline
+        \textbf{Agent Type} & $\alpha_i$ (RAG) & $\beta_i$ (Social) & $\gamma_i$ (Inertia) \\
+        \hline
+        \texttt{informed}    & 0.6 & 0.2 & 0.2 \\
+        \texttt{inflation}   & 0.5 & 0.3 & 0.2 \\
+        \texttt{unemployment}& 0.4 & 0.4 & 0.2 \\
+        \texttt{interest}    & 0.5 & 0.2 & 0.3 \\
+        \texttt{growth}      & 0.4 & 0.3 & 0.3 \\
+        \hline
+    \end{tabular}
+\end{table}
+
+The weight assignments reflect assumptions about how different agent types process information. Agents of type \texttt{informed} place the highest weight on documentary evidence, under the assumption that they attend more carefully to official fiscal reports. Agents of type \texttt{unemployment} and \texttt{growth} rely more on the social channel: labor market and activity signals are assumed to circulate through peer networks rather than formal documents. The inertia weight $\gamma_i$ captures how anchored each type is to its prior beliefs.
+
+The social signal received by agent $i$ in period $t$ is:
+\begin{equation}
+    S^{\text{Social}}_{i,t} = \bar{E}^{\text{inf}}_t + \eta_{i,t}, \quad \eta_{i,t} \sim \mathcal{N}(0, \sigma_\eta^2),
+    \label{eq:social_signal}
+\end{equation}
+where $\bar{E}^{\text{inf}}_t$ is the mean expectation of all \texttt{informed}-type agents at the start of period $t$, and $\sigma_\eta$ is the social noise standard deviation (a configurable parameter; $\sigma_\eta = 0.05$ in the baseline). Better-informed agents act as opinion leaders; their average sentiment reaches other agents with noise added.
+
+% -----------------------------------------------------------
+\section{LLM-Based Macro Signal Generation}
+\label{sec:llm_signal}
+% -----------------------------------------------------------
+
+Each period, every agent independently receives a fresh RAG signal with probability $p_{\text{info}}$ (configurable; $p_{\text{info}} = 0.30$ in the baseline). When the draw fails, the agent carries forward the signal from the previous period. This mechanism produces expectational dispersion across agents of the same type without any explicit coordination.
+
+When an agent does update, the system retrieves the three most relevant text chunks from ChromaDB using a query formed from the current calendar year, the agent's type keyword, and the term ``macroeconomia.'' Agents of type \texttt{informed} query the \texttt{summary} topic; all others query their specific category. For years beyond $y_{\text{cut}}$, the synthetic narrative replaces the retrieved text.
+
+The retrieved content is passed to \texttt{llama3} with a prompt asking the model to rate the macroeconomic outlook on a scale from $-1$ (crisis) to $+1$ (boom) and return its score as a JSON object:
+\begin{equation}
+    S^{\text{RAG}}_{i,t} \in [-1, 1].
+    \label{eq:rag_signal_range}
+\end{equation}
+The model runs at zero temperature for deterministic output. A regex-based fallback extracts the value if the response does not parse as JSON; if that also fails, the signal defaults to $0.0$.
+
+% [INSERT FIGURE: Sequence diagram: agent triggers retrieval -> ChromaDB similarity search (filtered by year) -> retrieved text -> LLM prompt -> JSON response -> parsed macro\_signal]
+
+% -----------------------------------------------------------
+\section{Savings Decision and Policy Function}
+\label{sec:policy}
+% -----------------------------------------------------------
+
+The savings decision has two layers: a theoretically grounded baseline and a behavioral adjustment driven by the agent's current expectation.
+
+The baseline savings function $\bar{a}(a, z)$ comes from the standard Aiyagari (1994) incomplete-markets model, in which infinitely-lived households maximize expected discounted utility subject to a no-borrowing constraint and idiosyncratic income risk. The solution is pre-computed and stored as a two-dimensional grid over 100 asset points spanning $[0, 10]$ and three productivity states $z \in \{0, 1, 2\}$. At runtime, the value for state $(a_{i,t}, z_{i,t})$ is recovered by linear interpolation between adjacent grid points:
+\begin{equation}
+    \bar{a}_{i,t+1} = \text{policy\_lookup}(a_{i,t},\, z_{i,t}),
+    \label{eq:policy_lookup}
+\end{equation}
+with boundary values clamped to the nearest grid point. The path to the policy file is itself a configurable parameter, which allows the framework to be used with alternative pre-solved policy grids without any code changes.
+
+The behavioral adjustment scales this baseline by the agent's macro-sensitivity and current expectation:
+\begin{equation}
+    a_{i,t+1} = \bar{a}_{i,t+1} \cdot \bigl(1 + x_i \cdot E_{i,t}\bigr),
+    \label{eq:behavioral_adjustment}
+\end{equation}
+subject to the constraint $a_{i,t+1} \geq 0$. A positive expectation amplifies savings above the Aiyagari level; a negative one reduces it. Agents with $x_i = 0$ follow the optimal policy exactly; those with $x_i = 1.0$ respond fully to expectational shifts. The expectation is clamped to $[-1, 1]$ before the multiplication to prevent extreme deviations.
+
+Using a pre-solved grid rather than within-simulation optimization keeps the behavioral perturbation interpretable: any deviation from the Aiyagari path is attributable to the expectation channel alone, not to numerical approximation error.
+
+% -----------------------------------------------------------
+\section{Simulation Execution}
+\label{sec:simulation}
+% -----------------------------------------------------------
+
+The main loop runs for $T$ periods, where $T$ is set in the configuration file. The calendar year for period $t$ is $y_{\text{start}} + t$. The loop proceeds as follows.
+
+\textbf{Step 1: Macro state.} Capital $K_t$ is summed over all $N$ agents. The shock processes update, the economy produces output via Equation~\eqref{eq:cobb_douglas}, and the macro state vector is assembled.
+
+\textbf{Step 2: Social signal.} The mean expectation of all \texttt{informed}-type agents from the previous period is used as $\bar{E}^{\text{inf}}_t$ for the current period. If social communication is disabled, this is set to zero.
+
+\textbf{Step 3: Document routing.} For years $\leq y_{\text{cut}}$, the system points agents at the real MFMP database. For later years, it generates a synthetic narrative from the current macro state.
+
+\textbf{Step 4: Agent decisions.} For each of the $N$ agents:
+\begin{enumerate}
+    \item Income $y_{i,t}$ is computed from Equation~\eqref{eq:income}.
+    \item With probability $p_{\text{info}}$, the agent retrieves a document and calls the LLM for an updated RAG signal; otherwise, the previous signal carries over.
+    \item The social signal is drawn from Equation~\eqref{eq:social_signal} using noise $\sigma_\eta$.
+    \item The expectation updates via Equation~\eqref{eq:expectation_update} using the type-specific weights from Table~\ref{tab:expectation_weights}.
+    \item The baseline savings $\bar{a}_{i,t+1}$ comes from the policy grid (Equation~\eqref{eq:policy_lookup}).
+    \item The behavioral adjustment (Equation~\eqref{eq:behavioral_adjustment}) is applied if enabled, and the borrowing constraint is enforced.
+    \item The productivity state $z_{i,t+1}$ is re-drawn from $\{0, 1, 2\}$.
+    \item The agent state updates to $(a_{i,t+1}, z_{i,t+1})$.
+\end{enumerate}
+
+\textbf{Step 5: Logging.} Each agent's full state and the aggregate macro variables are appended to a JSONL trace file for ex-post analysis.
+
+% [INSERT FIGURE: Flowchart of the per-period simulation loop showing the five main steps and data flows]
+
+% -----------------------------------------------------------
+\section{Summary of Design Choices}
+\label{sec:design_choices}
+% -----------------------------------------------------------
+
+Several design decisions in this framework warrant a brief explanation. The pre-solved Aiyagari grid keeps the behavioral channel interpretable: deviations from the benchmark path come from expectations, not from optimization approximation. The stochastic information acquisition probability $p_{\text{info}}$ generates cross-sectional expectation dispersion without requiring agents to coordinate; its value can be adjusted to explore how information frequency affects aggregate dynamics. The dual-document regime grounds the simulation in actual Colombian fiscal discourse through $y_{\text{cut}}$ and extends naturally beyond it. Finally, the modular architecture allows each mechanism to be toggled through the configuration file independently, so the effects of the RAG channel, the social channel, and the behavioral adjustment can each be isolated in ablation experiments.
